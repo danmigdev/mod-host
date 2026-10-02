@@ -26,6 +26,10 @@ Currently the host supports the following LV2 features:
 
 mod-host is part of the [MOD project](http://moddevices.com).
 
+For this branch's Raspberry Pi 4 / Pisound / 64-bit Patchbox OS integration,
+selected MOD/MODEP fixes and real JACK integration checks, see
+[the integration guide](docs/rpi4-pisound-integration.md).
+
 
 Building
 --------

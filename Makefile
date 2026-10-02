@@ -173,6 +173,9 @@ clean:
 test:
 	py.test tests/test_host.py
 
+integration-test: all
+	python3 tests/integration_test.py
+
 # manual page rule
 # Uses md2man to convert the README to groff man page
 # https://github.com/sunaku/md2man

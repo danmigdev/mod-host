@@ -26,6 +26,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <limits.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -40,7 +42,6 @@ typedef int SOCKET;
 
 #include "socket.h"
 #include "effects.h"
-#include "mod-memset.h"
 
 
 /*
@@ -162,9 +163,9 @@ int socket_start(int socket_port, int feedback_port, int buffer_size)
         setsockopt(g_fbserverfd, SOL_SOCKET, SO_REUSEPORT, &value, sizeof(value));
 
     /* Set TCP_NODELAY */
-    setsockopt(g_serverfd, SOL_TCP, TCP_NODELAY, &value, sizeof(value));
+    setsockopt(g_serverfd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
     if (feedback_port != 0)
-        setsockopt(g_fbserverfd, SOL_TCP, TCP_NODELAY, &value, sizeof(value));
+        setsockopt(g_fbserverfd, IPPROTO_TCP, TCP_NODELAY, &value, sizeof(value));
 
     /* Increase socket size */
     value = 131071;
@@ -265,10 +266,19 @@ int socket_send(int destination, const char *buffer, int size)
 
     while (size > 0)
     {
+#ifdef MSG_NOSIGNAL
+        ret = send(destination, buffer, size, MSG_NOSIGNAL);
+#else
         ret = send(destination, buffer, size, 0);
-        if (ret < 0)
+#endif
+#ifndef _WIN32
+        if (ret < 0 && errno == EINTR)
+            continue;
+#endif
+        if (ret <= 0)
         {
             perror("send error");
+            return -1;
         }
         size -= ret;
         buffer += ret;
@@ -291,7 +301,8 @@ void socket_run(int exit_on_failure)
     SOCKET clientfd, fbclientfd;
     int count;
     char *buffer;
-    char *msgbuffer;
+    size_t buffered = 0;
+    size_t capacity = g_buffer_size;
     msg_t msg;
 
     /* Allocates memory to receive buffer */
@@ -343,94 +354,57 @@ void socket_run(int exit_on_failure)
 
     while (g_serverfd != INVALID_SOCKET)
     {
-        mod_memset(buffer, 0, g_buffer_size);
-        count = recv(clientfd, buffer, g_buffer_size, 0);
+        if (buffered == capacity)
+        {
+            if (capacity > INT_MAX - (size_t)g_buffer_size)
+                break;
+
+            char *const resized = realloc(buffer, capacity + g_buffer_size);
+            if (resized == NULL)
+                break;
+
+            buffer = resized;
+            capacity += g_buffer_size;
+        }
+
+        const size_t available = capacity - buffered;
+        const int receive_size = available < (size_t)g_buffer_size ? (int)available : g_buffer_size;
+        count = recv(clientfd, buffer + buffered, receive_size, 0);
+
+#ifndef _WIN32
+        if (count < 0 && errno == EINTR)
+            continue;
+#endif
 
         if (count > 0) /* Data received */
         {
-            if (count == g_buffer_size && buffer[count - 1] != '\0')
+            buffered += count;
+            size_t consumed = 0;
+
+            /* TCP packets do not define protocol boundaries. Keep incomplete
+               commands until their NUL terminator arrives, and dispatch every
+               complete command even when the next one is still incomplete. */
+            while (consumed < buffered)
             {
-                /* if message is bigger than our buffer, dynamically allocate more data until we receive it all */
-                int new_count, new_buffer_size;
+                char *const frame = buffer + consumed;
+                char *const end = memchr(frame, '\0', buffered - consumed);
+                if (end == NULL)
+                    break;
 
-                msgbuffer = NULL;
-                new_count = g_buffer_size;
-                new_buffer_size = g_buffer_size;
-
-                while (new_count == g_buffer_size)
+                const size_t frame_size = end - frame + 1;
+                if (frame_size > 1 && g_receive_cb)
                 {
-                    new_buffer_size += g_buffer_size;
-
-                    if (msgbuffer == NULL)
-                    {
-                        msgbuffer = malloc(new_buffer_size);
-                        memcpy(msgbuffer, buffer, g_buffer_size);
-                    }
-                    else
-                    {
-                        msgbuffer = realloc(msgbuffer, new_buffer_size);
-                    }
-
-                    mod_memset(msgbuffer + count, 0, g_buffer_size);
-                    new_count = recv(clientfd, msgbuffer + count, g_buffer_size, 0);
-
-                    if (new_count > 0) /* Data received */
-                    {
-                        count += new_count;
-
-                        if (msgbuffer[count - 1] == '\0')
-                            break;
-                    }
-                    else if (new_count < 0) /* Error */
-                    {
-                        if (! exit_on_failure)
-                            goto outside_loop;
-
-                        perror("read error");
-                        exit(EXIT_FAILURE);
-                    }
-                    else if (new_count == 0) /* Client disconnected */
-                    {
-                        goto outside_loop;
-                    }
-                }
-            }
-            else
-            {
-                msgbuffer = buffer;
-            }
-
-            if (g_receive_cb)
-            {
-                // ignore leftover null bytes
-                while (count > 1 && msgbuffer[count - 1] == '\0')
-                    --count;
-
-                // make sure to keep 1 null byte at the end of the string
-                ++count;
-
-                msg.data = msgbuffer;
-
-                while (count > 0)
-                {
-                    if (*msg.data == '\0')
-                    {
-                        --count;
-                        ++msg.data;
-                        continue;
-                    }
-
                     msg.sender_id = clientfd;
-                    msg.data_size = strlen(msg.data) + 1;
+                    msg.data = frame;
+                    msg.data_size = frame_size;
                     g_receive_cb(&msg);
-
-                    count -= msg.data_size;
-                    msg.data += msg.data_size;
                 }
+                consumed += frame_size;
             }
 
-            if (msgbuffer != buffer)
-                free(msgbuffer);
+            buffered -= consumed;
+            if (buffered != 0 && consumed != 0)
+                memmove(buffer, buffer + consumed, buffered);
 
             effects_idle_external_uis();
         }
@@ -448,7 +422,6 @@ void socket_run(int exit_on_failure)
         }
     }
 
-outside_loop:
     if (fbclientfd != INVALID_SOCKET)
     {
         g_fbclientfd = INVALID_SOCKET;
