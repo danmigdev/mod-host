@@ -46,7 +46,16 @@ CFLAGS += -Winit-self -Wjump-misses-init -Wmissing-prototypes -Wnested-externs -
 endif
 
 # libraries
-LIBS = $(shell pkg-config --libs jack lilv-0) -lpthread -lm
+LIBS = $(shell pkg-config --libs lilv-0)
+
+ifeq ($(MOD_DESKTOP),1)
+LIBS += $(subst -ljack ,-ljackserver ,$(shell pkg-config --libs jack))
+ifneq ($(MACOS)$(WINDOWS),true)
+LIBS += -Wl,-rpath,'$$ORIGIN/..'
+endif
+else
+LIBS += $(shell pkg-config --libs jack)
+endif
 
 # include paths
 INCS = $(shell pkg-config --cflags jack lilv-0)
@@ -93,10 +102,19 @@ LIBS += $(shell pkg-config --libs hylia)
 INCS += $(shell pkg-config --cflags hylia) -DHAVE_HYLIA
 endif
 
-# macOS incompatible flags
-ifeq (,$(findstring apple,$(shell $(CC) -dumpmachine)))
+LIBS += -lpthread -lm
+
+# incompatible flags
+MACHINE = $(shell $(CC) -dumpmachine)
+ifneq (,$(findstring mingw,$(MACHINE)))
+LIBS += -liphlpapi -lws2_32
+endif
+
+ifeq (,$(findstring apple,$(MACHINE)))
 LDFLAGS += -Wl,--no-undefined
+ifeq (,$(findstring mingw,$(MACHINE)))
 LIBS += -lrt
+endif
 endif
 
 # source and object files
@@ -115,7 +133,11 @@ $(PROG): $(OBJ)
 	$(CC) $(OBJ) $(LDFLAGS) $(LIBS) -o $@
 
 $(PROG).so: $(OBJ)
+ifeq ($(MODAPP),1)
+	$(CC) $(OBJ) $(LDFLAGS) $(subst -ljack ,-ljackserver ,$(LIBS)) -shared -o $@
+else
 	$(CC) $(OBJ) $(LDFLAGS) $(LIBS) -shared -o $@
+endif
 
 # meta-rule to generate the object files
 %.o: %.$(EXT) src/info.h
@@ -140,16 +162,19 @@ install: install_man
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 $(PROG) $(DESTDIR)$(BINDIR)
 	install -d $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
-	install -m 755 $(PROG).so $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
-	install -m 755 fake-input.so $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
-	install -m 755 mod-monitor.so $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
+	install -m 644 $(PROG).so $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
+	install -m 644 fake-input.so $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
+	install -m 644 mod-monitor.so $(DESTDIR)$(shell pkg-config --variable=libdir jack)/jack/
 
 # clean rule
 clean:
-	@rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*/*.o $(PROG) $(PROG).so fake-input.so mod-monitor.so src/info.h
+	@rm -f $(SRC_DIR)/*.o $(SRC_DIR)/*/*.o $(PROG) $(PROG).exe $(PROG).so fake-input.so mod-monitor.so src/info.h
 
 test:
 	py.test tests/test_host.py
+
+integration-test: all
+	python3 tests/integration_test.py
 
 # manual page rule
 # Uses md2man to convert the README to groff man page

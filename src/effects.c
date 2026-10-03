@@ -30,12 +30,30 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
 #include <sys/stat.h>
+
+#ifdef _WIN32
+#include <direct.h>
+#include <io.h>
+#include <winsock2.h>
+#include <windows.h>
+typedef unsigned int uint;
+#define PRIi64 "lld"
+#define PRId64 "llu"
+#define RTLD_LOCAL 0
+#define RTLD_NOW 0
+#define dlopen(path, flags)  LoadLibrary(path)
+#define dlsym(lib, funcname) GetProcAddress((HMODULE)lib, funcname)
+#define dlclose(lib)         FreeLibrary((HMODULE)lib)
+#define setenv(...)
+#define unsetenv(...)
+#else
+#include <dlfcn.h>
+#endif
 
 /* Jack */
 #include <jack/jack.h>
@@ -48,23 +66,23 @@
 
 /* LV2 and Lilv */
 #include <lilv/lilv.h>
-#include <lv2/lv2plug.in/ns/ext/atom/atom.h>
-#include <lv2/lv2plug.in/ns/ext/atom/forge.h>
-#include <lv2/lv2plug.in/ns/ext/buf-size/buf-size.h>
-#include <lv2/lv2plug.in/ns/ext/event/event.h>
-#include <lv2/lv2plug.in/ns/ext/log/log.h>
-#include <lv2/lv2plug.in/ns/ext/midi/midi.h>
-#include <lv2/lv2plug.in/ns/ext/options/options.h>
-#include <lv2/lv2plug.in/ns/ext/patch/patch.h>
-#include <lv2/lv2plug.in/ns/ext/parameters/parameters.h>
-#include <lv2/lv2plug.in/ns/ext/port-props/port-props.h>
-#include <lv2/lv2plug.in/ns/ext/presets/presets.h>
-#include <lv2/lv2plug.in/ns/ext/resize-port/resize-port.h>
-#include <lv2/lv2plug.in/ns/ext/state/state.h>
-#include <lv2/lv2plug.in/ns/ext/time/time.h>
-#include <lv2/lv2plug.in/ns/ext/urid/urid.h>
-#include <lv2/lv2plug.in/ns/ext/uri-map/uri-map.h>
-#include <lv2/lv2plug.in/ns/ext/worker/worker.h>
+#include <lv2/atom/atom.h>
+#include <lv2/atom/forge.h>
+#include <lv2/buf-size/buf-size.h>
+#include <lv2/event/event.h>
+#include <lv2/log/log.h>
+#include <lv2/midi/midi.h>
+#include <lv2/options/options.h>
+#include <lv2/patch/patch.h>
+#include <lv2/parameters/parameters.h>
+#include <lv2/port-props/port-props.h>
+#include <lv2/presets/presets.h>
+#include <lv2/resize-port/resize-port.h>
+#include <lv2/state/state.h>
+#include <lv2/time/time.h>
+#include <lv2/urid/urid.h>
+#include <lv2/uri-map/uri-map.h>
+#include <lv2/worker/worker.h>
 #include "lv2/control-input-port-change-request.h"
 #include "lv2/lv2-hmi.h"
 #include "lv2/mod-license.h"
@@ -75,9 +93,9 @@
 #endif
 
 #ifdef WITH_EXTERNAL_UI_SUPPORT
-#include <lv2/lv2plug.in/ns/extensions/ui/ui.h>
-#include <lv2/lv2plug.in/ns/ext/data-access/data-access.h>
-#include <lv2/lv2plug.in/ns/ext/instance-access/instance-access.h>
+#include <lv2/data-access/data-access.h>
+#include <lv2/instance-access/instance-access.h>
+#include <lv2/ui/ui.h>
 #endif
 
 #ifdef HAVE_CONTROLCHAIN
@@ -211,7 +229,7 @@ enum PortHints {
     HINT_SHOULD_UPDATE = 1 << 6, // inputs only, for external UIs
     // cv
     HINT_CV_MOD        = 1 << 0, // uses mod cvport
-    HINT_CV_RANGES     = 1 << 0, // port info includes ranges
+    HINT_CV_RANGES     = 1 << 1, // port info includes ranges
     // events
     HINT_TRANSPORT     = 1 << 0,
     HINT_MIDI_EVENT    = 1 << 1,
@@ -896,8 +914,8 @@ static void ExternalControllerWriteFunction(LV2UI_Controller controller,
 */
 
 
-#ifdef __APPLE__
-// FIXME missing on macOS
+#if defined(__APPLE__) || defined(_WIN32)
+// FIXME missing on macOS and Windows
 static char* strchrnul(const char *s, int c)
 {
     char *r = strchr(s, c);
@@ -909,10 +927,32 @@ static char* strchrnul(const char *s, int c)
 }
 #endif
 
+#ifdef _WIN32
+// missing on Windows
+static char* realpath(const char *name, char *resolved)
+{
+    if (name == NULL)
+        return NULL;
+
+    if (_access(name, 4) != 0)
+        return NULL;
+
+    char *retname = NULL;
+
+    if ((retname = resolved) == NULL)
+        retname = malloc(PATH_MAX + 2);
+
+    if (retname == NULL)
+        return NULL;
+
+    return _fullpath(retname, name, PATH_MAX);
+}
+#endif
+
 static void InstanceDelete(int effect_id)
 {
     if (INSTANCE_IS_VALID(effect_id))
-        bzero(&g_effects[effect_id], sizeof(effect_t));
+        memset(&g_effects[effect_id], 0, sizeof(effect_t));
 }
 
 static int InstanceExist(int effect_id)
@@ -1000,7 +1040,11 @@ static int BufferSize(jack_nframes_t nframes, void* data)
             options[4].type = 0;
             options[4].value = NULL;
 
+            lilv_instance_deactivate(effect->lilv_instance);
+
             effect->options_interface->set(effect->lilv_instance->lv2_handle, options);
+
+            lilv_instance_activate(effect->lilv_instance);
         }
     }
 #ifdef HAVE_HYLIA
@@ -2527,9 +2571,9 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
                             // set a sane low limit
                             if (dvalue <= 20.0)
                                 g_transport_bpm = 20;
-                            // >280 BPM over MIDI is unreasonable
-                            else if (dvalue >= 280.0)
-                                g_transport_bpm = 280.0;
+                            // >300 BPM over MIDI is unreasonable
+                            else if (dvalue >= 300.0)
+                                g_transport_bpm = 300.0;
                             // we are good!
                             else
                                 g_transport_bpm = dvalue;
@@ -2713,16 +2757,20 @@ static int ProcessGlobalClient(jack_nframes_t nframes, void *arg)
     switch (g_noisegate_channel)
     {
     case 0: // no gate
-        memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
-        memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
+        if (audio_out1_buf != audio_in1_buf)
+            memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
+        if (audio_out2_buf != audio_in2_buf)
+            memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
         break;
     case 1: // left channel only
-        memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
+        if (audio_out2_buf != audio_in2_buf)
+            memcpy(audio_out2_buf, audio_in2_buf, sizeof(float)*nframes);
         for (uint32_t i=0; i<nframes; ++i)
             audio_out1_buf[i] = gate_push_sample_and_apply(&g_noisegate, audio_in1_buf[i]);
         break;
     case 2: // right channel only
-        memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
+        if (audio_out1_buf != audio_in1_buf)
+            memcpy(audio_out1_buf, audio_in1_buf, sizeof(float)*nframes);
         for (uint32_t i=0; i<nframes; ++i)
             audio_out2_buf[i] = gate_push_sample_and_apply(&g_noisegate, audio_in2_buf[i]);
         break;
@@ -3870,6 +3918,9 @@ int effects_init(void* client)
             jack_client_close(g_jack_global_client);
         return ERR_JACK_PORT_REGISTER;
     }
+
+    jack_port_tie(g_audio_in1_port, g_audio_out1_port);
+    jack_port_tie(g_audio_in2_port, g_audio_out2_port);
 #endif
 
     if (g_jack_global_client != NULL && strcmp(jack_get_client_name(g_jack_global_client), "mod-host") == 0 && ! monitor_client_init())
@@ -4065,6 +4116,9 @@ int effects_init(void* client)
 
     /* Load all LV2 data */
     g_lv2_data = lilv_world_new();
+#ifdef LILV_OPTION_OBJECT_INDEX
+    lilv_world_set_option(g_lv2_data, LILV_OPTION_OBJECT_INDEX, NULL);
+#endif
     lilv_world_load_all(g_lv2_data);
     g_plugins = lilv_world_get_all_plugins(g_lv2_data);
 
@@ -4387,7 +4441,7 @@ int effects_finish(int close_client)
     sem_post(&g_postevents_semaphore);
     pthread_join(g_postevents_thread, NULL);
 
-    if (close_client)
+    if (close_client && g_jack_global_client != NULL && strcmp(jack_get_client_name(g_jack_global_client), "mod-host") == 0)
         monitor_client_stop();
 
     effects_remove(REMOVE_ALL);
@@ -5472,48 +5526,19 @@ int effects_preset_save(int effect_id, const char *dir, const char *file_name, c
     }
 
     effect = &g_effects[effect_id];
-
-    LV2_State_Make_Path makePath = {
-        effect, MakePluginStatePathDuringLoadSave
-    };
-    const LV2_Feature feature_makePath = { LV2_STATE__makePath, &makePath };
-
-    const LV2_Feature* features[] = {
-        &g_uri_map_feature,
-        &g_urid_map_feature,
-        &g_urid_unmap_feature,
-        &g_options_feature,
-#ifdef __MOD_DEVICES__
-        &g_hmi_wc_feature,
-#endif
-        &g_license_feature,
-        &g_buf_size_features[0],
-        &g_buf_size_features[1],
-        &g_buf_size_features[2],
-        &g_lv2_log_feature,
-        &g_state_freePath_feature,
-        &feature_makePath,
-        effect->features[CTRLPORT_REQUEST_FEATURE],
-        effect->features[WORKER_FEATURE],
-        NULL
-    };
-
     scratch_dir = GetPluginStateDir(effect->instance, g_lv2_scratch_dir);
-    effect->state_dir = dir;
 
     LilvState* const state = lilv_state_new_from_instance(
-        g_effects[effect_id].lilv_plugin,
-        g_effects[effect_id].lilv_instance,
+        effect->lilv_plugin,
+        effect->lilv_instance,
         &g_urid_map,
         scratch_dir,
         dir,
         dir,
         dir,
-        GetPortValueForState, &g_effects[effect_id],
+        GetPortValueForState, effect,
         LV2_STATE_IS_POD|LV2_STATE_IS_PORTABLE,
-        features);
-
-    effect->state_dir = NULL;
+        effect->features);
 
     if (label) {
         lilv_state_set_label(state, label);
@@ -5529,6 +5554,10 @@ int effects_preset_save(int effect_id, const char *dir, const char *file_name, c
 int effects_preset_show(const char *uri, char **state_str)
 {
     LilvNode* preset_uri = lilv_new_uri(g_lv2_data, uri);
+
+    if (! preset_uri) {
+        return ERR_LV2_INVALID_PRESET_URI;
+    }
 
     if (lilv_world_load_resource(g_lv2_data, preset_uri) >= 0)
     {
@@ -5577,9 +5606,11 @@ int effects_remove(int effect_id)
         {
             for (int i = 0; g_capture_ports[i]; i++)
             {
-                const char **capture_connections =
-                    jack_port_get_connections(jack_port_by_name(g_jack_global_client, g_capture_ports[i]));
+                jack_port_t *port = jack_port_by_name(g_jack_global_client, g_capture_ports[i]);
+                if (! port)
+                    continue;
 
+                const char **capture_connections = jack_port_get_connections(port);
                 if (capture_connections)
                 {
                     for (int j = 0; capture_connections[j]; j++)
@@ -5910,7 +5941,7 @@ int effects_remove(int effect_id)
                 if (g_lv2_scratch_dir != NULL)
                 {
                     // recursively delete state folder
-                    bzero(state_filename, sizeof(state_filename));
+                    memset(state_filename, 0, sizeof(state_filename));
                     snprintf(state_filename, PATH_MAX-1, "%s/effect-%d",
                              g_lv2_scratch_dir, effect->instance);
                     RecursivelyRemovePluginPath(state_filename);
@@ -6837,7 +6868,7 @@ int effects_licensee(int effect_id, char **licensee_ptr)
 int effects_set_beats_per_minute(double bpm)
 {
   int result = SUCCESS;
-  if ((20.0 <= bpm) && (bpm <= 280.0)) {
+  if ((20.0 <= bpm) && (bpm <= 300.0)) {
     // Change the current global value and set a flag that it was changed.
     g_transport_bpm = bpm;
     g_transport_reset = true;
@@ -7696,7 +7727,7 @@ int effects_state_load(const char *dir)
     LilvState *state;
 
     char state_filename[PATH_MAX];
-    bzero(state_filename, sizeof(state_filename));
+    memset(state_filename, 0, sizeof(state_filename));
 
     LV2_State_Make_Path makePath = {
         NULL, MakePluginStatePathDuringLoadSave
@@ -7774,7 +7805,11 @@ int effects_state_load(const char *dir)
 
 int effects_state_save(const char *dir)
 {
+#ifdef _WIN32
+    if (_access(dir, 4) != 0 && _mkdir(dir) != 0)
+#else
     if (access(dir, F_OK) != 0 && mkdir(dir, 0755) != 0)
+#endif
     {
         fprintf(stderr, "failed to get access to project folder %s\n", dir);
         return ERR_INVALID_OPERATION;
@@ -7785,7 +7820,7 @@ int effects_state_save(const char *dir)
     char *scratch_dir, *plugin_dir;
 
     char state_dir[PATH_MAX];
-    bzero(state_dir, sizeof(state_dir));
+    memset(state_dir, 0, sizeof(state_dir));
 
     LV2_State_Make_Path makePath = {
         NULL, MakePluginStatePathDuringLoadSave
